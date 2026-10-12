@@ -2,6 +2,7 @@ module ChebyshevLevin
 
 using LinearAlgebra
 
+include("chebyshev.jl")
 include("problems.jl")
 include("operators.jl")
 include("solve.jl")

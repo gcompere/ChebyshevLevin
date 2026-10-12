@@ -1,7 +1,7 @@
 name = "ChebyshevLevin"
 uuid = "e8d8c9f0-7f3e-4a8b-9f1c-2d3e4f5a6b7c"
 authors = ["Loic Honet"]
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 
 [deps]
 SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"

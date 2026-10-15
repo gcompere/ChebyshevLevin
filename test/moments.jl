@@ -32,30 +32,59 @@ using ChebyshevLevin.Moments
     @test_throws ArgumentError integrate_moments(bad)
 end
 
-@testset "High-degree inverse-phase precision" begin
-    # Degree 64 in the automatic near-critical regime (abs(beta)/b <= 1).
-    # Large detuning is already covered at degree 16 below;
-    # 1024-bit expint at large imaginary argument is too costly for this check.
-    for beta in (-0.3,1e-6,0.3)
-        weights=inverse_phase_weights(beta,.31,64)
-        precise=inverse_phase_weights(beta,.31,64;precision_bits=1024)
-        @test weights ≈ precise atol=2e-14 rtol=0
+include("moment_reference.jl")
+
+@testset "Float64 inverse-phase moments against independent series" begin
+    for (N,eta) in ((8,1e-16),(16,1e-8),(32,-.1),(64,1e-12),(64,-1e-12),
+                    (64,.1),(64,-.1),(64,1.),(64,-1.),(128,1e-8),(128,.1),
+                    (128,1.),(256,1e-8),(256,.1),(256,1.),(64,30.),(8,510.61945248368005),
+                    (24,510.61945248368005),(64,510.61945248368005),
+                    (16,prevfloat(1.)),(16,1.),(16,nextfloat(1.)))
+        reference=series_reference(eta,N)
+        weights=inverse_phase_weights(eta,1.,N)
+        @test eltype(weights) === ComplexF64
+        @test maximum(abs,weights-reference)<1e-14
+        @test inverse_phase_weights(-eta,1.,N)==conj.(weights)
+    end
+    # Roundoff/conditioning in the test reference itself is checked separately.
+    a=series_reference(1.,256;bits=1280)
+    b=series_reference(1.,256;bits=1536)
+    @test maximum(abs,a-b)<big"1e-30"
+    for eta in (1e-16,1e-8,.1,1.)
+        weights=inverse_phase_weights(eta,1.,64)
+        refined=inverse_phase_weights(eta,1.,64;moment_atol=5e-15)
+        @test maximum(abs,weights-refined)<1e-14
     end
 end
 
-@testset "Inverse-phase moments: exact primitives and precision" begin
+@testset "Inverse-phase moments: exact primitives and scaling" begin
     b=.31
     for beta in (-30.,-.3,-1e-6,0.,1e-6,.3,30.)
-        weights=Moments.inverse_phase_weights(beta,b,16)
+        weights=inverse_phase_weights(beta,b,16)
+        reference=b*series_reference(beta/b,16)
+        @test maximum(abs,weights-reference)/b<1e-14
         for q in (2,3,6,12)
             H(x)=q*x^(q-1)+im*beta*x^(q-2)
             coeffs=Moments.chebyshev_coefficients(H,(0.,b),16)
             @test sum(coeffs.*weights) ≈ b^q*cis(-beta/b) atol=2e-13 rtol=2e-13
         end
-        @test weights ≈ Moments.inverse_phase_weights(beta,b,16;precision_bits=512) atol=2e-14 rtol=0
     end
-    weights=Moments.inverse_phase_weights(0.,b,32)
-    for k in 0:32
-        @test weights[k+1] ≈ (isodd(k) ? 0. : b/(1-k*k)) atol=1e-14
+    weights=inverse_phase_weights(0.,b,256)
+    for k in 0:256
+        @test weights[k+1] == (isodd(k) ? 0. : b/(1-k*k))
     end
+end
+
+@testset "Moment accuracy requests and bounded failure" begin
+    @test_throws ArgumentError inverse_phase_weights(Inf,1.,4)
+    @test_throws ArgumentError inverse_phase_weights(1.,0.,4)
+    @test_throws ArgumentError inverse_phase_weights(1.,1.,257)
+    @test_throws ArgumentError inverse_phase_weights(1.,1.,-1)
+    @test_throws ArgumentError inverse_phase_weights(1.,1.,4;moment_atol=0.)
+    @test_throws ArgumentError inverse_phase_weights(1.,1.,4;moment_atol=Inf)
+    @test_throws ArgumentError inverse_phase_weights(1.,1.,4;moment_atol=eps()/2)
+    @test_throws ArgumentError inverse_phase_weights(1.,1.,4;maxevals=1)
+    @test_throws ArgumentError inverse_phase_weights(floatmax(Float64),floatmin(Float64),4)
+    @test_throws ErrorException inverse_phase_weights(1.,1.,256;maxevals=42)
+    @test_throws ErrorException inverse_phase_weights(.1,1.,64;moment_atol=eps(),maxevals=4000)
 end

@@ -1,20 +1,16 @@
 """
 Numerical integration against supplied Chebyshev moments. This backend depends
-on the shared Chebyshev utilities and SpecialFunctions. It knows no Kerr
+on the shared Chebyshev utilities and QuadGK. It knows no Kerr
 geometry or radial domain and does not solve a Levin ODE. `MomentProblem` is the generic boundary;
 `inverse_phase_weights` supplies one moment family. Physics and solver selection
 belong to callers.
 """
 module Moments
 
-# Direct dependency: expint must retain Complex{BigFloat} guard precision here.
-# Relying on another package's transitive import would not declare this API use;
-# replacing it with Float64 expint would discard the cancellation margin below.
-import SpecialFunctions
-using ..ChebyshevLevin: chebyshev_gauss_nodes, from_chebyshev_coordinate, chebyshev_value
+using QuadGK: quadgk_segbuf!
+using ..ChebyshevLevin: chebyshev_gauss_nodes, from_chebyshev_coordinate, chebyshev_value, weighted_chebyshev_values!
 export MomentProblem, MomentEstimate, moment_estimate, integrate_moments, inverse_phase_weights
 const DEFAULT_ORDERS = (8,12,16,24,32,48,64)
-const PRECISION_LOCK = ReentrantLock()
 
 """
     MomentProblem(amplitude, (left,right), moments; weight_norm, orders=DEFAULT_ORDERS)
@@ -68,53 +64,158 @@ struct MomentEstimate
     probes::Vector{ComplexF64}
 end
 
-"""
-    inverse_phase_weights(beta, b, order; precision_bits=256)
+# Re-sum the final quadrature panels with componentwise compensated addition.
+# QuadGK's error estimate does not include its final accumulation roundoff.
+function sum_moment_segments!(result, segments)
+    fill!(result,0)
+    correction=zeros(eltype(result),length(result))
+    for segment in segments, j in eachindex(result)
+        addend=segment.I[j]-correction[j]
+        total=result[j]+addend
+        correction[j]=(total-result[j])-addend
+        result[j]=total
+    end
+    return result
+end
 
-Return `integral_0^b T_k(2x/b-1)*exp(-im*beta/x) dx`, k=0:order, for real beta.
-Set u=x/b and v=1/u. For z=i*beta/b,
-`integral_0^1 u^j exp(-z/u) du = integral_1^Inf exp(-z*v)/v^(j+2) dv = E_(j+2)(z)`.
-The monomial moment on [0,b] is therefore `b^(j+1)*E_(j+2)(z)`; for a polynomial
-in u the integral is `b*sum(p[j+1]*E_(j+2)(z))`. At beta=0 use `1/(j+1)`.
-The shifted Chebyshev recurrence is `P_(k+1)=(4u-2)P_k-P_(k-1)`.
-
-Independent exponential-integral calls avoid unstable upward moment recurrence.
-Shifted-polynomial coefficient 1-norms grow as T_k(3), approximately
-`(3+sqrt(8))^k/2`, costing about 2.55*k bits in cancellation. The retained rule
-`max(precision_bits,8*order+128)` exceeds that growth and leaves a margin above
-53-bit output precision. This is conservative working precision, not an error
-certificate for SpecialFunctions; tests compare with higher precision. Round
-only final weights to ComplexF64. The lock serializes this module's precision
-scopes; unrelated BigFloat users must manage their own precision scopes.
 """
-function inverse_phase_weights(beta::Real,b::Real,order::Integer;precision_bits::Integer=256)
-    isfinite(Float64(beta)) && isfinite(Float64(b)) && Float64(b)>0 ||
+    inverse_phase_weights(beta, b, order; moment_atol=1e-14, maxevals=2_000_000)
+
+Return `integral_0^b T_k(2x/b-1)*exp(-im*beta/x) dx`, `k=0:order`, using
+Float64/ComplexF64 throughout. `moment_atol` requests normalized absolute error:
+error in each returned weight divided by `b`. It is not a relative tolerance or
+an error certificate. The previous arbitrary-precision `precision_bits` control
+has been replaced by this accuracy request.
+
+For `eta=beta/b >= 0`, put `u=b/x`. Choose a turn U>=1, keep the real segment
+`1 <= u <= U` and rotate only its tail to `u=U-im*t`. No pole is crossed, and the
+large closing arc vanishes because the rational amplitude is O(abs(u)^(-2)).
+The exact normalized moment is
+
+    integral_1^U T_k(2/u-1)*exp(-im*eta*u)/u^2 du
+    - im*exp(-im*eta*U)*integral_0^Inf T_k(2/(U-im*t)-1)*exp(-eta*t)/(U-im*t)^2 dt.
+
+The polynomial is never expanded into monomials. On the real segment its
+modulus is <= 1. For 0<eta<1 use U=max(2,order^2). On its tail,
+zeta=2/(U-im*t)-1 satisfies
+abs(zeta+1)<=2/U and abs(zeta-1)<=2. The Chebyshev ellipse identity gives
+abs(T_k(zeta)) <= cosh(k*sqrt(2/U)) <= C=cosh(order*sqrt(2/U)) <= cosh(sqrt(2)).
+Thus the absolute integral norm is <= 1-1/U+pi*C/(2U), less than 1.000592 at
+order 64. This removes the huge artificial cancellation of the monomial
+representation; it does not cure relative conditioning near moment zeros.
+Rotating at U=1 without sufficient damping would instead allow
+abs(T_64(im)) approximately 1.57e24.
+
+For this weak-damping regime set t=U*exp(s). The tail's absolute integrand
+is <= C/U*exp(-abs(s)); truncating
+s to [-L,L] has error <= 2C/U*exp(-L), uniformly down to eta=0. Negative eta
+uses conjugation. Exactly zero uses odd weights zero and even weights b/(1-k^2),
+without a small-eta cutoff or an invalid Taylor expansion under the integral.
+
+For eta>=1, damping permits the earlier turn U=max(1,order/sqrt(eta)). Use
+v=eta*t on the tail. If z0=2/U-1, abs(zeta-z0)<=2t/U^2, so the ellipse identity
+bounds abs(T_k(zeta))<=exp(2k*sqrt(t)/U)<=exp(2sqrt(v)). The entire damped factor
+is therefore <=exp(2sqrt(v)-v)<=exp(2-v/2). Its absolute tail integral is
+<=2exp(2)/(eta*U^2); truncation after v=V costs <=2exp(2-V/2)/(eta*U^2).
+Choose V from the same omission budget. This avoids a long oscillatory real
+segment when the damping is strong, without exposing large cancelling terms.
+
+Gauss-Kronrod vector quadrature shares phases and Chebyshev values. Initial
+real panels grow by at most 1.5 and limit eta*Delta(u) to pi. Half the requested
+accuracy is reserved for the two quadratures (80% real, 20% tail); the tail
+omission budget is min(1e-17,moment_atol/1000). Compensated panel accumulation
+reduces summation roundoff. The remaining margin is empirical, not a rigorous
+bound on polynomial/phase evaluation or floating-point quadrature error.
+
+Degrees 0:256 and finite Float64 eta are accepted. The initial real mesh costs
+O(eta*order^2) for eta<1 and O(max(0,order*sqrt(eta)-eta)) for eta>=1,
+plus panels resolving the polynomial near u=1. Adaptive cost is not guaranteed.
+Throw an error if the initial mesh or adaptive calculation exhausts maxevals,
+if its error indicator exceeds moment_atol, or if values are nonfinite.
+No arbitrary-precision fallback or silently clipped degree/detuning is used.
+A tight request may fail at the Float64 roundoff floor. The supplied-moment
+interpolation diagnostic does not include these callback errors; callers remain
+responsible for propagating moment accuracy to their final physical observable.
+"""
+function inverse_phase_weights(beta::Real,b::Real,order::Integer;
+                               moment_atol::Real=1e-14,maxevals::Integer=2_000_000)
+    beta64,b64,tolerance=Float64(beta),Float64(b),Float64(moment_atol)
+    isfinite(beta64) && isfinite(b64) && b64>0 ||
         throw(ArgumentError("Expected finite beta and positive b representable in Float64."))
-    0<=order<=256 && precision_bits>=128 || throw(ArgumentError("Invalid degree or guard precision."))
-    lock(PRECISION_LOCK) do
-        setprecision(BigFloat,max(precision_bits,8order+128)) do
-            z=Complex{BigFloat}(0,BigFloat(beta)/BigFloat(b))
-            moments=[iszero(z) ? Complex{BigFloat}(inv(BigFloat(k+1))) :
-                     SpecialFunctions.expint(k+2,z) for k in 0:order]
-            weights=ComplexF64[]
-            previous=BigFloat[1]
-            push!(weights,ComplexF64(BigFloat(b)*moments[1]))
-            order==0 && return weights
-            current=BigFloat[-1,2]
-            for k in 1:order
-                push!(weights,ComplexF64(BigFloat(b)*sum(current[j]*moments[j] for j in eachindex(current))))
-                k==order && break
-                following=zeros(BigFloat,k+2)
-                for j in eachindex(current)
-                    following[j]-=2current[j]
-                    following[j+1]+=4current[j]
-                end
-                following[1:length(previous)].-=previous
-                previous,current=current,following
-            end
-            return weights
+    0<=order<=256 || throw(ArgumentError("Expected degree in 0:256."))
+    isfinite(tolerance) && tolerance>=eps(Float64) ||
+        throw(ArgumentError("moment_atol must be finite and at least eps(Float64)."))
+    maxevals>=42 || throw(ArgumentError("maxevals must be at least 42."))
+    eta=beta64/b64
+    isfinite(eta) || throw(ArgumentError("beta/b must be finite in Float64."))
+    eta==0 && return ComplexF64[isodd(k) ? 0.0 : b64/(1-k*k) for k in 0:order]
+    detuning=abs(eta)
+    damped=detuning>=1
+    U=damped ? max(1.0,order/sqrt(detuning)) : Float64(max(2,order*order))
+    tail_budget=min(1e-17,tolerance/1000)
+    if damped
+        # Logarithms avoid overflow for large, finite detuning.
+        V=max(1.0,2*(log(2.0)+2-log(detuning)-2log(U)-log(tail_budget)))
+        tail_panels=Float64[0.0,V]
+        tail_omission=exp(log(2.0)+2-V/2-log(detuning)-2log(U))
+    else
+        C=cosh(order*sqrt(2/U))
+        L=ceil(log(2C/(U*tail_budget)))
+        tail_panels=Float64[-L,0.0,L]
+        tail_omission=2C/U*exp(-L)
+    end
+    # Guard the initial mesh before allocation, including phase-step overflow.
+    (U-1)*(detuning/pi)<maxevals/21 ||
+        error("Inverse-phase moment initial mesh exceeds maxevals; reduce degree/detuning or increase the work budget.")
+    panels=Float64[1.0]
+    while panels[end]<U
+        push!(panels,min(U,1.5panels[end],panels[end]+pi/detuning))
+    end
+    21*(length(panels)-1)<maxevals || error("Inverse-phase moment initial mesh exceeds maxevals.")
+    real_calls,tail_calls=Ref(0),Ref(0)
+    function real_integrand!(values,u)
+        real_calls[]+=1
+        weighted_chebyshev_values!(values,2/u-1,cis(-detuning*u)/(u*u))
+    end
+    phase=-im*cis(-detuning*U)
+    function tail_integrand!(values,s)
+        tail_calls[]+=1
+        if damped
+            denominator=complex(U,-s/detuning)
+            factor=(phase/detuning)*exp(-s)/(denominator*denominator)
+            weighted_chebyshev_values!(values,2/denominator-1,factor)
+        else
+            t=exp(s)
+            denominator=complex(1.0,-t)
+            factor=(phase/U)*t/(denominator*denominator)*exp(-detuning*U*t)
+            weighted_chebyshev_values!(values,2/(U*denominator)-1,factor)
         end
     end
+    real_budget,tail_quad_budget=.4tolerance,.1tolerance
+    norm_inf=values->maximum(abs,values)
+    real_value=zeros(ComplexF64,order+1)
+    real_error=0.0
+    if U>1
+        real_value,real_error,real_segments=quadgk_segbuf!(real_integrand!,real_value,panels;
+            order=10,atol=real_budget,rtol=0,norm=norm_inf,maxevals)
+        sum_moment_segments!(real_value,real_segments)
+    end
+    tail_limit=min(maxevals,200_000)
+    tail_value,tail_error,tail_segments=quadgk_segbuf!(tail_integrand!,zeros(ComplexF64,order+1),tail_panels;
+        order=10,atol=tail_quad_budget,rtol=0,norm=norm_inf,maxevals=tail_limit)
+    real_calls[]<maxevals && tail_calls[]<tail_limit ||
+        error("Inverse-phase moment quadrature exhausted its work budget; accuracy is unresolved.")
+    # Returned estimates can change when QuadGK re-sums many panels. The tighter
+    # stop requests above leave margin for this; assess the final indicator
+    # against the user's unchanged tolerance rather than an internal fraction.
+    isfinite(real_error+tail_error) && real_error+tail_error+tail_omission<=tolerance ||
+        error("Inverse-phase moment quadrature did not meet moment_atol; Float64 roundoff or discretization remains unresolved.")
+    sum_moment_segments!(tail_value,tail_segments)
+    weights=real_value+tail_value
+    eta<0 && (weights=conj.(weights))
+    weights .*= b64
+    all(isfinite,weights) || error("Nonfinite inverse-phase moment result.")
+    return weights
 end
 
 function chebyshev_coefficients(amplitude,interval,order)

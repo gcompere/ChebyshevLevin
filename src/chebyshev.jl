@@ -25,3 +25,19 @@ function chebyshev_value(coefficients, coordinate)
     end
     return coefficients[1] + coordinate * next_value - following_value
 end
+
+# Evaluate every degree with one shared recurrence. This differs from Clenshaw,
+# which contracts supplied coefficients into one polynomial value. The factor
+# allows vector-valued quadrature to reuse its phase and Jacobian without a
+# temporary polynomial vector. All scalar arithmetic follows the input types.
+function weighted_chebyshev_values!(values, coordinate, factor)
+    previous,current=one(coordinate),coordinate
+    values[1]=factor
+    length(values)==1 && return values
+    values[2]=factor*current
+    for j in 3:length(values)
+        previous,current=current,2coordinate*current-previous
+        values[j]=factor*current
+    end
+    return values
+end

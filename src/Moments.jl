@@ -96,7 +96,8 @@ The exact normalized moment is
     - im*exp(-im*eta*U)*integral_0^Inf T_k(2/(U-im*t)-1)*exp(-eta*t)/(U-im*t)^2 dt.
 
 The polynomial is never expanded into monomials. On the real segment its
-modulus is <= 1. For 0<eta<1 use U=max(2,order^2). On its tail,
+modulus is <= 1. Define eta_switch=1/max(2,order^2). For
+0<eta<eta_switch use U=max(2,order^2). On its tail,
 zeta=2/(U-im*t)-1 satisfies
 abs(zeta+1)<=2/U and abs(zeta-1)<=2. The Chebyshev ellipse identity gives
 abs(T_k(zeta)) <= cosh(k*sqrt(2/U)) <= C=cosh(order*sqrt(2/U)) <= cosh(sqrt(2)).
@@ -112,13 +113,16 @@ s to [-L,L] has error <= 2C/U*exp(-L), uniformly down to eta=0. Negative eta
 uses conjugation. Exactly zero uses odd weights zero and even weights b/(1-k^2),
 without a small-eta cutoff or an invalid Taylor expansion under the integral.
 
-For eta>=1, damping permits the earlier turn U=max(1,order/sqrt(eta)). Use
+For eta>=eta_switch, use the earlier turn U=max(1,order/sqrt(eta)). Use
 v=eta*t on the tail. If z0=2/U-1, abs(zeta-z0)<=2t/U^2, so the ellipse identity
 bounds abs(T_k(zeta))<=exp(2k*sqrt(t)/U)<=exp(2sqrt(v)). The entire damped factor
 is therefore <=exp(2sqrt(v)-v)<=exp(2-v/2). Its absolute tail integral is
 <=2exp(2)/(eta*U^2); truncation after v=V costs <=2exp(2-V/2)/(eta*U^2).
-Choose V from the same omission budget. This avoids a long oscillatory real
-segment when the damping is strong, without exposing large cancelling terms.
+This bound holds for every eta>0, not only eta>=1. For order>=2, eta_switch
+is where order^2 and order/sqrt(eta) coincide. Turning earlier above that
+threshold avoids an unnecessarily long oscillatory real segment, while keeping
+the same growth/damping and omission bounds. Choose V from the same omission
+budget. Orders 0 and 1 use eta_switch=1/2; both bounds remain valid there.
 
 Gauss-Kronrod vector quadrature shares phases and Chebyshev values. Initial
 real panels grow by at most 1.5 and limit eta*Delta(u) to pi. Half the requested
@@ -128,8 +132,9 @@ reduces summation roundoff. The remaining margin is empirical, not a rigorous
 bound on polynomial/phase evaluation or floating-point quadrature error.
 
 Degrees 0:256 and finite Float64 eta are accepted. The initial real mesh costs
-O(eta*order^2) for eta<1 and O(max(0,order*sqrt(eta)-eta)) for eta>=1,
-plus panels resolving the polynomial near u=1. Adaptive cost is not guaranteed.
+O(log(U)+eta*(U-1)) panels before adaptive refinement. Here U=max(2,order^2)
+below eta_switch and U=max(1,order/sqrt(eta)) above it. Adaptive cost, including
+resolution of the polynomial near u=1, is not guaranteed.
 Throw an error if the initial mesh or adaptive calculation exhausts maxevals,
 if its error indicator exceeds moment_atol, or if values are nonfinite.
 No arbitrary-precision fallback or silently clipped degree/detuning is used.
@@ -150,7 +155,9 @@ function inverse_phase_weights(beta::Real,b::Real,order::Integer;
     isfinite(eta) || throw(ArgumentError("beta/b must be finite in Float64."))
     eta==0 && return ComplexF64[isodd(k) ? 0.0 : b64/(1-k*k) for k in 0:order]
     detuning=abs(eta)
-    damped=detuning>=1
+    # The damped bound applies for any positive detuning. For order>=2,
+    # switch where the two turn lengths coincide, rather than waiting for eta=1.
+    damped=detuning>=1/max(2,order*order)
     U=damped ? max(1.0,order/sqrt(detuning)) : Float64(max(2,order*order))
     tail_budget=min(1e-17,tolerance/1000)
     if damped

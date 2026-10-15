@@ -37,7 +37,7 @@ include("moment_reference.jl")
 @testset "Float64 inverse-phase moments against independent series" begin
     for (N,eta) in ((8,1e-16),(16,1e-8),(32,-.1),(64,1e-12),(64,-1e-12),
                     (64,.1),(64,-.1),(64,1.),(64,-1.),(128,1e-8),(128,.1),
-                    (128,1.),(256,1e-8),(256,.1),(256,1.),(64,30.),(8,510.61945248368005),
+                    (128,1.),(256,.5),(256,1e-8),(256,.1),(256,1.),(64,30.),(8,510.61945248368005),
                     (24,510.61945248368005),(64,510.61945248368005),
                     (16,prevfloat(1.)),(16,1.),(16,nextfloat(1.)))
         reference=series_reference(eta,N)
@@ -55,6 +55,23 @@ include("moment_reference.jl")
         refined=inverse_phase_weights(eta,1.,64;moment_atol=5e-15)
         @test maximum(abs,weights-refined)<1e-14
     end
+end
+
+@testset "Degree-dependent contour switch" begin
+    # Compare each branch and the boundary against the independent defining
+    # moment reference, including the low degrees and maximum accepted degree.
+    for N in (0,1,2,8,64,256)
+        threshold=1/max(2,N*N)
+        for eta in (prevfloat(threshold),threshold,nextfloat(threshold))
+            weights=inverse_phase_weights(eta,1.,N)
+            @test maximum(abs,weights-series_reference(eta,N))<1e-14
+            @test inverse_phase_weights(-eta,1.,N)==conj.(weights)
+        end
+    end
+    # A long real prefix exhausted this budget before the earlier-turn change.
+    # Check bounded numerical work instead of machine-dependent wall-clock time.
+    weights=inverse_phase_weights(.5,1.,256;maxevals=20_000)
+    @test maximum(abs,weights-series_reference(.5,256))<1e-14
 end
 
 @testset "Inverse-phase moments: exact primitives and scaling" begin

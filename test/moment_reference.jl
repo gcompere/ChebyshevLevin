@@ -27,6 +27,7 @@ function series_reference(eta::Float64,N::Int;bits=max(768,4N+256+ceil(Int,2abs(
         previous,poly=BigFloat[1],BigFloat[-1,2]
         for n in 1:N
             push!(weights,sum(poly.*e[1:n+1]))
+            n==N && break # No T_(N+1) is needed by this reference vector.
             following=zeros(BigFloat,n+2)
             for j in eachindex(poly)
                 following[j]-=2poly[j];following[j+1]+=4poly[j]

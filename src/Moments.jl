@@ -155,6 +155,17 @@ function inverse_phase_weights(beta::Real,b::Real,order::Integer;
     isfinite(eta) || throw(ArgumentError("beta/b must be finite in Float64."))
     eta==0 && return ComplexF64[isodd(k) ? 0.0 : b64/(1-k*k) for k in 0:order]
     detuning=abs(eta)
+    plan=inverse_phase_contour_plan(detuning,order,tolerance,maxevals)
+    quadrature=evaluate_inverse_phase_contour(plan,detuning,order,tolerance,maxevals)
+    return checked_inverse_phase_weights(quadrature,plan,eta,b64,tolerance,maxevals)
+end
+
+# Log of the damped-tail omission bound 2exp(2-V/2)/(detuning*U^2).
+# Keep the subtraction order explicit, including at V=0 when choosing V.
+damped_tail_log_bound(detuning,U,V) = log(2.0)+2-V/2-log(detuning)-2log(U)
+
+# Plan the turn, tail truncation and initial real mesh without evaluating moments.
+function inverse_phase_contour_plan(detuning,order,tolerance,maxevals)
     # The damped bound applies for any positive detuning. For order>=2,
     # switch where the two turn lengths coincide, rather than waiting for eta=1.
     damped=detuning>=1/max(2,order*order)
@@ -162,9 +173,9 @@ function inverse_phase_weights(beta::Real,b::Real,order::Integer;
     tail_budget=min(1e-17,tolerance/1000)
     if damped
         # Logarithms avoid overflow for large, finite detuning.
-        V=max(1.0,2*(log(2.0)+2-log(detuning)-2log(U)-log(tail_budget)))
+        V=max(1.0,2*(damped_tail_log_bound(detuning,U,0.0)-log(tail_budget)))
         tail_panels=Float64[0.0,V]
-        tail_omission=exp(log(2.0)+2-V/2-log(detuning)-2log(U))
+        tail_omission=exp(damped_tail_log_bound(detuning,U,V))
     else
         C=cosh(order*sqrt(2/U))
         L=ceil(log(2C/(U*tail_budget)))
@@ -179,6 +190,13 @@ function inverse_phase_weights(beta::Real,b::Real,order::Integer;
         push!(panels,min(U,1.5panels[end],panels[end]+pi/detuning))
     end
     21*(length(panels)-1)<maxevals || error("Inverse-phase moment initial mesh exceeds maxevals.")
+    return (;damped,U,tail_panels,tail_omission,panels)
+end
+
+# Execute the two vector quadratures on the planned contour. Both keep T_k in
+# Chebyshev form and re-sum the accepted panels with compensated addition.
+function evaluate_inverse_phase_contour(plan,detuning,order,tolerance,maxevals)
+    (;damped,U,tail_panels,panels)=plan
     real_calls,tail_calls=Ref(0),Ref(0)
     function real_integrand!(values,u)
         real_calls[]+=1
@@ -210,17 +228,24 @@ function inverse_phase_weights(beta::Real,b::Real,order::Integer;
     tail_limit=min(maxevals,200_000)
     tail_value,tail_error,tail_segments=quadgk_segbuf!(tail_integrand!,zeros(ComplexF64,order+1),tail_panels;
         order=10,atol=tail_quad_budget,rtol=0,norm=norm_inf,maxevals=tail_limit)
-    real_calls[]<maxevals && tail_calls[]<tail_limit ||
+    sum_moment_segments!(tail_value,tail_segments)
+    return (;real_value,tail_value,real_error,tail_error,
+            real_calls=real_calls[],tail_calls=tail_calls[],tail_limit)
+end
+
+# Enforce the work/accuracy indicators, then restore the sign and physical scale.
+function checked_inverse_phase_weights(quadrature,plan,eta,b,tolerance,maxevals)
+    (;real_value,tail_value,real_error,tail_error,real_calls,tail_calls,tail_limit)=quadrature
+    real_calls<maxevals && tail_calls<tail_limit ||
         error("Inverse-phase moment quadrature exhausted its work budget; accuracy is unresolved.")
     # Returned estimates can change when QuadGK re-sums many panels. The tighter
     # stop requests above leave margin for this; assess the final indicator
     # against the user's unchanged tolerance rather than an internal fraction.
-    isfinite(real_error+tail_error) && real_error+tail_error+tail_omission<=tolerance ||
+    isfinite(real_error+tail_error) && real_error+tail_error+plan.tail_omission<=tolerance ||
         error("Inverse-phase moment quadrature did not meet moment_atol; Float64 roundoff or discretization remains unresolved.")
-    sum_moment_segments!(tail_value,tail_segments)
     weights=real_value+tail_value
     eta<0 && (weights=conj.(weights))
-    weights .*= b64
+    weights .*= b
     all(isfinite,weights) || error("Nonfinite inverse-phase moment result.")
     return weights
 end
